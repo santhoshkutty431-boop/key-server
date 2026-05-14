@@ -1,173 +1,121 @@
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const { Octokit } = require("@octokit/rest");
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 7860; // Hugging Face default port
+const PORT = process.env.PORT || 7860;
 
-// Middleware
+// GitHub Configuration (Zero Setup DB)
+const GITHUB_TOKEN = process.env.GH_TOKEN;
+const REPO_OWNER = 'santhoshkutty431-boop';
+const REPO_NAME = 'key-server';
+const FILE_PATH = 'keys.json';
+
+const octokit = new Octokit({ auth: GITHUB_TOKEN });
+
 app.use(cors());
 app.use(bodyParser.json());
 
-// MongoDB Connection
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:admin@cluster0.example.mongodb.net/keyserver?retryWrites=true&w=majority";
-
-mongoose.connect(MONGO_URI)
-    .then(() => console.log('Connected to MongoDB Atlas'))
-    .catch(err => console.error('MongoDB Connection Error:', err));
-
-// User Schema
-const userSchema = new mongoose.Schema({
-        username: { type: String, required: true },
-        email: { type: String, required: true, unique: true },
-        password: { type: String, required: true },
-        plan: { type: String, enum: ['Normal', 'Pro', 'Ultra', 'Admin'], default: 'Normal' },
-        hwid: { type: String, default: null },
-        tokens_used: { type: Number, default: 0 },
-        token_limit: { type: Number, default: 1000 },
-        is_banned: { type: Boolean, default: false },
-        created_at: { type: Date, default: Date.now }
-});
-
-const User = mongoose.model('User', userSchema);
-
-// --- AUTHENTICATION (CLIENT) ---
-
-// Verify Key (Key = Username in this simple setup, or we can use a dedicated field)
-app.get('/verify', async (req, res) => {
+// Helper to Load Keys from GitHub
+async function loadKeys() {
         try {
-                    const { key, hwid } = req.query;
-                    if (!key || !hwid) return res.status(400).send("Missing parameters");
+                    const { data } = await octokit.repos.getContent({
+                                    owner: REPO_OWNER,
+                                    repo: REPO_NAME,
+                                    path: FILE_PATH,
+                    });
+                    const content = Buffer.from(data.content, 'base64').toString();
+                    return { keys: JSON.parse(content), sha: data.sha };
+        } catch (err) {
+                    return { keys: {}, sha: null };
+        }
+}
 
-            const user = await User.findOne({ username: key });
+// Helper to Save Keys to GitHub
+async function saveKeys(keys, sha) {
+        const content = Buffer.from(JSON.stringify(keys, null, 2)).toString('base64');
+        await octokit.repos.createOrUpdateFileContents({
+                    owner: REPO_OWNER,
+                    repo: REPO_NAME,
+                    path: FILE_PATH,
+                    message: 'Update keys database',
+                    content: content,
+                    sha: sha
+        });
+}
 
-            if (!user) return res.status(401).send("Invalid key");
-                    if (user.is_banned) return res.status(403).send("Account suspended");
+// --- CLIENT ENDPOINTS ---
 
-            // HWID Locking
-            if (user.hwid === null) {
-                            user.hwid = hwid;
-                            await user.save();
-                            return res.status(200).send("OK");
+app.get('/verify', async (req, res) => {
+        const { key, hwid } = req.query;
+        const { keys } = await loadKeys();
+
+            if (!keys[key]) return res.status(401).send("Invalid key");
+        if (keys[key].is_banned) return res.status(403).send("Suspended");
+
+            if (keys[key].hwid === null) {
+                        keys[key].hwid = hwid;
+                        const { sha } = await loadKeys();
+                        await saveKeys(keys, sha);
+                        return res.status(200).send("OK");
             }
 
-            if (user.hwid !== hwid) {
-                            return res.status(403).send("HWID mismatch");
-            }
-
-            // Token usage tracking (optional)
-            user.tokens_used += 1;
-                    await user.save();
+            if (keys[key].hwid !== hwid) return res.status(403).send("HWID mismatch");
 
             res.status(200).send("OK");
-        } catch (err) {
-                    res.status(500).send("Server Error");
-        }
 });
 
-// --- ADMIN API (Matching admin_portal.html) ---
+// --- ADMIN API ---
 
-// Get Stats
 app.get('/api/admin/stats', async (req, res) => {
-        try {
-                    const total = await User.countDocuments();
-                    const banned = await User.countDocuments({ is_banned: true });
-
-            const by_plan = {
-                            Normal: await User.countDocuments({ plan: 'Normal' }),
-                            Pro: await User.countDocuments({ plan: 'Pro' }),
-                            Ultra: await User.countDocuments({ plan: 'Ultra' }),
-                            Admin: await User.countDocuments({ plan: 'Admin' })
-            };
-
-            const tokensResult = await User.aggregate([{ $group: { _id: null, total: { $sum: "$tokens_used" } } }]);
-                    const tokens_today = tokensResult[0]?.total || 0;
-
-            res.json({ total, banned, by_plan, tokens_today });
-        } catch (err) {
-                    res.status(500).json({ error: err.message });
-        }
+        const { keys } = await loadKeys();
+        const list = Object.values(keys);
+        res.json({
+                    total: list.length,
+                    banned: list.filter(u => u.is_banned).length,
+                    by_plan: {
+                                    Normal: list.filter(u => u.plan === 'Normal').length,
+                                    Pro: list.filter(u => u.plan === 'Pro').length,
+                                    Ultra: list.filter(u => u.plan === 'Ultra').length,
+                                    Admin: list.filter(u => u.plan === 'Admin').length
+                    },
+                    tokens_today: 0
+        });
 });
 
-// List Users
-app.get('/api/admin/users', async (req, res) => {
-        try {
-                    const users = await User.find().sort({ created_at: -1 });
-                    res.json(users);
-        } catch (err) {
-                    res.status(500).json({ error: err.message });
-        }
-});
+            app.get('/api/admin/users', async (req, res) => {
+                    const { keys } = await loadKeys();
+                    res.json(Object.keys(keys).map(k => ({ id: k, username: k, ...keys[k] })));
+            });
 
-// Get User
-app.get('/api/admin/users/:id', async (req, res) => {
-        try {
-                    const user = await User.findById(req.params.id);
-                    res.json(user);
-        } catch (err) {
-                    res.status(404).json({ error: "User not found" });
-        }
-});
-
-// Create User
 app.post('/api/admin/users', async (req, res) => {
-        try {
-                    const { username, email, password, plan } = req.body;
-
-            const limits = { Normal: 1000, Pro: 5000, Ultra: 20000, Admin: 999999 };
-                    const token_limit = limits[plan] || 1000;
-
-            const newUser = new User({ username, email, password, plan, token_limit });
-                    await newUser.save();
-                    res.json(newUser);
-        } catch (err) {
-                    res.status(400).json({ error: err.message });
-        }
+        const { username, email, password, plan } = req.body;
+        const { keys, sha } = await loadKeys();
+        keys[username] = { email, password, plan, hwid: null, is_banned: false, created_at: new Date().toISOString() };
+        await saveKeys(keys, sha);
+        res.json({ success: true });
 });
 
-// Update User
-app.patch('/api/admin/users/:id', async (req, res) => {
-        try {
-                    const updates = req.body;
-                    if (updates.plan) {
-                                    const limits = { Normal: 1000, Pro: 5000, Ultra: 20000, Admin: 999999 };
-                                    updates.token_limit = limits[updates.plan];
-                    }
-                    const user = await User.findByIdAndUpdate(req.params.id, updates, { new: true });
-                    res.json(user);
-        } catch (err) {
-                    res.status(400).json({ error: err.message });
-        }
-});
-
-// Reset HWID/Tokens
-app.post('/api/admin/users/:id/reset', async (req, res) => {
-        try {
-                    const user = await User.findById(req.params.id);
-                    user.hwid = null;
-                    user.tokens_used = 0;
-                    await user.save();
-                    res.json({ success: true });
-        } catch (err) {
-                    res.status(400).json({ error: err.message });
-        }
-});
-
-// Delete User
 app.delete('/api/admin/users/:id', async (req, res) => {
-        try {
-                    await User.findByIdAndDelete(req.params.id);
-                    res.json({ success: true });
-        } catch (err) {
-                    res.status(400).json({ error: err.message });
+        const { keys, sha } = await loadKeys();
+        delete keys[req.params.id];
+        await saveKeys(keys, sha);
+        res.json({ success: true });
+});
+
+app.post('/api/admin/users/:id/reset', async (req, res) => {
+        const { keys, sha } = await loadKeys();
+        if (keys[req.params.id]) {
+                    keys[req.params.id].hwid = null;
+                    await saveKeys(keys, sha);
         }
+        res.json({ success: true });
 });
 
-// Ping (Keep Alive)
-app.get('/ping', (req, res) => res.send('Pong! Server is 24/7.'));
+app.get('/ping', (req, res) => res.send('24/7 Key Server Active'));
 
-app.listen(PORT, () => {
-        console.log(`Key Server v2 running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+
+app.get('
