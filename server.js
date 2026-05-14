@@ -1,73 +1,173 @@
 const express = require('express');
-const fs = require('fs');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+require('dotenv').config();
+
 const app = express();
+const PORT = process.env.PORT || 7860; // Hugging Face default port
 
-const DB_FILE = 'keys.json';
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-function loadKeys() {
-    if (!fs.existsSync(DB_FILE)) {
-        fs.writeFileSync(DB_FILE, JSON.stringify({}));
-    }
-    return JSON.parse(fs.readFileSync(DB_FILE));
-}
+// MongoDB Connection
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://admin:admin@cluster0.example.mongodb.net/keyserver?retryWrites=true&w=majority";
 
-function saveKeys(keys) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(keys, null, 2));
-}
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('Connected to MongoDB Atlas'))
+    .catch(err => console.error('MongoDB Connection Error:', err));
 
-app.get('/verify', (req, res) => {
-    const { key, hwid } = req.query;
-    const keys = loadKeys();
-
-    if (!keys.hasOwnProperty(key)) {
-        return res.status(401).send("Invalid key");
-    }
-
-    if (keys[key] === null) {
-        keys[key] = hwid;
-        saveKeys(keys);
-        return res.status(200).send("OK");
-    }
-
-    if (keys[key] !== hwid) {
-        return res.status(403).send("HWID mismatch");
-    }
-
-    res.status(200).send("OK");
+// User Schema
+const userSchema = new mongoose.Schema({
+        username: { type: String, required: true },
+        email: { type: String, required: true, unique: true },
+        password: { type: String, required: true },
+        plan: { type: String, enum: ['Normal', 'Pro', 'Ultra', 'Admin'], default: 'Normal' },
+        hwid: { type: String, default: null },
+        tokens_used: { type: Number, default: 0 },
+        token_limit: { type: Number, default: 1000 },
+        is_banned: { type: Boolean, default: false },
+        created_at: { type: Date, default: Date.now }
 });
 
-app.get('/addkey', (req, res) => {
-    const { key } = req.query;
-    const keys = loadKeys();
+const User = mongoose.model('User', userSchema);
 
-    if (keys.hasOwnProperty(key)) {
-        return res.status(400).send("Key already exists");
-    }
+// --- AUTHENTICATION (CLIENT) ---
 
-    keys[key] = null;
-    saveKeys(keys);
-    res.status(200).send(`Key ${key} added`);
+// Verify Key (Key = Username in this simple setup, or we can use a dedicated field)
+app.get('/verify', async (req, res) => {
+        try {
+                    const { key, hwid } = req.query;
+                    if (!key || !hwid) return res.status(400).send("Missing parameters");
+
+            const user = await User.findOne({ username: key });
+
+            if (!user) return res.status(401).send("Invalid key");
+                    if (user.is_banned) return res.status(403).send("Account suspended");
+
+            // HWID Locking
+            if (user.hwid === null) {
+                            user.hwid = hwid;
+                            await user.save();
+                            return res.status(200).send("OK");
+            }
+
+            if (user.hwid !== hwid) {
+                            return res.status(403).send("HWID mismatch");
+            }
+
+            // Token usage tracking (optional)
+            user.tokens_used += 1;
+                    await user.save();
+
+            res.status(200).send("OK");
+        } catch (err) {
+                    res.status(500).send("Server Error");
+        }
 });
 
-app.get('/listkeys', (req, res) => {
-    const keys = loadKeys();
-    res.json(keys);
+// --- ADMIN API (Matching admin_portal.html) ---
+
+// Get Stats
+app.get('/api/admin/stats', async (req, res) => {
+        try {
+                    const total = await User.countDocuments();
+                    const banned = await User.countDocuments({ is_banned: true });
+
+            const by_plan = {
+                            Normal: await User.countDocuments({ plan: 'Normal' }),
+                            Pro: await User.countDocuments({ plan: 'Pro' }),
+                            Ultra: await User.countDocuments({ plan: 'Ultra' }),
+                            Admin: await User.countDocuments({ plan: 'Admin' })
+            };
+
+            const tokensResult = await User.aggregate([{ $group: { _id: null, total: { $sum: "$tokens_used" } } }]);
+                    const tokens_today = tokensResult[0]?.total || 0;
+
+            res.json({ total, banned, by_plan, tokens_today });
+        } catch (err) {
+                    res.status(500).json({ error: err.message });
+        }
 });
 
-app.get('/resetkey', (req, res) => {
-    const { key } = req.query;
-    const keys = loadKeys();
-
-    if (!keys.hasOwnProperty(key)) {
-        return res.status(404).send("Key not found");
-    }
-
-    keys[key] = null;
-    saveKeys(keys);
-    res.status(200).send(`Key ${key} reset`);
+// List Users
+app.get('/api/admin/users', async (req, res) => {
+        try {
+                    const users = await User.find().sort({ created_at: -1 });
+                    res.json(users);
+        } catch (err) {
+                    res.status(500).json({ error: err.message });
+        }
 });
 
-const PORT = process.env.PORT || 3000;
+// Get User
+app.get('/api/admin/users/:id', async (req, res) => {
+        try {
+                    const user = await User.findById(req.params.id);
+                    res.json(user);
+        } catch (err) {
+                    res.status(404).json({ error: "User not found" });
+        }
+});
+
+// Create User
+app.post('/api/admin/users', async (req, res) => {
+        try {
+                    const { username, email, password, plan } = req.body;
+
+            const limits = { Normal: 1000, Pro: 5000, Ultra: 20000, Admin: 999999 };
+                    const token_limit = limits[plan] || 1000;
+
+            const newUser = new User({ username, email, password, plan, token_limit });
+                    await newUser.save();
+                    res.json(newUser);
+        } catch (err) {
+                    res.status(400).json({ error: err.message });
+        }
+});
+
+// Update User
+app.patch('/api/admin/users/:id', async (req, res) => {
+        try {
+                    const updates = req.body;
+                    if (updates.plan) {
+                                    const limits = { Normal: 1000, Pro: 5000, Ultra: 20000, Admin: 999999 };
+                                    updates.token_limit = limits[updates.plan];
+                    }
+                    const user = await User.findByIdAndUpdate(req.params.id, updates, { new: true });
+                    res.json(user);
+        } catch (err) {
+                    res.status(400).json({ error: err.message });
+        }
+});
+
+// Reset HWID/Tokens
+app.post('/api/admin/users/:id/reset', async (req, res) => {
+        try {
+                    const user = await User.findById(req.params.id);
+                    user.hwid = null;
+                    user.tokens_used = 0;
+                    await user.save();
+                    res.json({ success: true });
+        } catch (err) {
+                    res.status(400).json({ error: err.message });
+        }
+});
+
+// Delete User
+app.delete('/api/admin/users/:id', async (req, res) => {
+        try {
+                    await User.findByIdAndDelete(req.params.id);
+                    res.json({ success: true });
+        } catch (err) {
+                    res.status(400).json({ error: err.message });
+        }
+});
+
+// Ping (Keep Alive)
+app.get('/ping', (req, res) => res.send('Pong! Server is 24/7.'));
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+        console.log(`Key Server v2 running on port ${PORT}`);
 });
